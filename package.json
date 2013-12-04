@@ -1,11 +1,30 @@
 {
-    "name": "vc0706",
-    "version": "1.0.0",
-    "main": "./vc0706.js",
-    "author": "Brian Egizi <me@brianegizi.com>",
-    "description": "Rough VC0706 Camera library for Raspberry Pi",
-    "repository": {
-	    "type": "git",
-	    "url": "https://github.com/vyykn/VC0706.git"
-  	}
+  "name": "vc0706",
+  "version": "1.0.0",
+  "main": "./vc0706.js",
+  "author": "Brian Egizi <me@brianegizi.com>",
+  "description": "Rough VC0706 Camera library for Raspberry Pi",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vyykn/VC0706.git"
+  },
+  "scripts": {
+    "install": "node-gyp rebuild"
+  },
+  "gypfile": true,
+  "bugs": {
+    "url": "https://github.com/vyykn/VC0706/issues"
+  },
+  "keywords": [
+    "VC0706",
+    "Raspberry",
+    "Pi",
+    "Camera",
+    "Motion",
+    "Detector"
+  ],
+  "license": "BSD-2-Clause",
+  "dependencies": {
+    "events": "*"
+  }
 }
