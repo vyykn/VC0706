@@ -1,6 +1,6 @@
 {
   "name": "vc0706",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "main": "./vc0706.js",
   "author": "Brian Egizi <me@brianegizi.com>",
   "description": "Rough VC0706 Camera library for Raspberry Pi",
