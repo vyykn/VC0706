@@ -81,21 +81,20 @@ public:
     ~Camera();
     void reset();
     void setMotionDetect(int flag);
+    bool checkReply(int cmd, int size);
     void clearBuffer();
     bool motionDetected();
     char * getVersion();
     char * takePicture();
-    int stopMotion;
+    int motion;
     int ready;
+    int fd;
 
 private:
-    bool checkReply(int cmd, int size);
     void resumeVideo();
 
     uint8_t offscreen[8]; // font width;
 
-    // Brian's Variables
-    int fd;
     int frameptr;
     int bufferLen;
     int serialNum;
@@ -109,8 +108,8 @@ Camera::Camera() {
     frameptr = 0;
     bufferLen = 0;
     serialNum = 0;
-    stopMotion = 0;
-    ready = 0;
+    motion = 1;
+    ready = 1;
 
 
     if ((fd = serialOpen("/dev/ttyAMA0", BAUD)) < 0)
@@ -118,6 +117,7 @@ Camera::Camera() {
 
     if (wiringPiSetup() == -1)
         exit(1);
+
 
     ready = 1;
 
@@ -240,60 +240,34 @@ char * Camera::getVersion()
 void Camera::setMotionDetect(int flag)
 {
     serialPutchar(fd, (char)0x56);
-    serialPutchar(fd, (char)serialNum);
-    serialPutchar(fd, (char)MOTION_CTRL);
-    serialPutchar(fd, (char)0x03);
-    serialPutchar(fd, (char)MOTIONCONTROL);
-    serialPutchar(fd, (char)UARTMOTION);
-    serialPutchar(fd, (char)ACTIVATEMOTION);
-    
-    if (checkReply(MOTION_CTRL, 5) == false)
-        printf("Error setting motion control settings\n");
-
-    clearBuffer();
+    serialPutchar(fd, (char)0x00);
+    serialPutchar(fd, (char)0x42);
+    serialPutchar(fd, (char)0x04);
+    serialPutchar(fd, (char)0x01);
+    serialPutchar(fd, (char)0x01);
+    serialPutchar(fd, (char)0x00);
+    serialPutchar(fd, (char)0x00);
     
     serialPutchar(fd, (char)0x56);
     serialPutchar(fd, (char)serialNum);
     serialPutchar(fd, (char)COMM_MOTION_CTRL);
     serialPutchar(fd, (char)0x01);
     serialPutchar(fd, (char)flag);
-    
-    if (checkReply(COMM_MOTION_CTRL, 5) == false)
-        printf("Error turning on motion detection\n");
-}
 
-bool Camera::motionDetected()
-{
-    int reply[5];
-    int t_count = 0;
-    int length = 0;
-    int timeout = 4 * TO_SCALE;
-    
-    while ((timeout != t_count) && (length != CAMERABUFFSIZ) && length < 5)
-    {
-        int avail = serialDataAvail(fd);
-        if (avail <= 0)
-        {
-            usleep(TO_U);
-            t_count++;
-            continue;
-        }
-        t_count = 0;
-        // there's a byte!
-        int newChar = serialGetchar(fd);
-        reply[length++] = (char)newChar;
-    }
-    
-    if (reply[0] == 0x76 && reply[1] == serialNum && reply[2] == COMM_MOTION_DETECTED && reply[3] == 0x00)
-        return true;
-    else
-        return false;
+    clearBuffer();
+
 }
 
 
 char * Camera::takePicture()
 {
     frameptr = 0;
+
+    // Force Stop motion detect
+    setMotionDetect(0);
+
+    //Clear Buffer
+    clearBuffer();
 
     serialPutchar(fd, (char)0x56);
     serialPutchar(fd, (char)serialNum);
@@ -303,8 +277,10 @@ char * Camera::takePicture()
     
     if (checkReply(FBUF_CTRL, 5) == false)
     {
+        printf("Frame checkReply Failed\n");
         return empty;
     }
+
     
     serialPutchar(fd, (char)0x56);
     serialPutchar(fd, (char)serialNum);
@@ -406,8 +382,6 @@ char * Camera::takePicture()
     int t = (int)time(NULL);
     sprintf(name, "images/%u.jpg", t);
     
-    umask(0111);
-    
     FILE *jpg = fopen(name, "w");
     if (jpg != NULL)
     {
@@ -422,6 +396,13 @@ char * Camera::takePicture()
     sprintf(imageName, "%u.jpg", t);
     
     resumeVideo();
+
+    //Clear Buffer
+    clearBuffer();
+
+    // Force Stop motion detect
+    setMotionDetect(0);
+
     
     return imageName;
     
@@ -433,6 +414,15 @@ char * Camera::takePicture()
 
 namespace {
 
+    /* thread loop */
+    uv_loop_t *loop;
+
+    /* async thread ref */
+    uv_async_t async;
+
+    /* emitter object */
+    Persistent<Object> emitter;
+
     struct PictureBaton {
         Persistent<Function> callback;
 
@@ -442,19 +432,6 @@ namespace {
         std::string error_message;
         std::string pictureName;
 
-    };
-
-    struct ResetBaton {
-        Persistent<Function> callback;
-        Persistent<Object> emitter;
-
-        char *display_message;
-
-        bool error;
-        std::string error_message;
-        std::string versionNumber;
-
-        int32_t result;
     };
 
     struct MotionBaton {
@@ -470,6 +447,8 @@ namespace {
         int32_t result;
     };
 
+
+
     static Camera *camera;
 
     class VC0706: public ObjectWrap {
@@ -479,13 +458,10 @@ namespace {
             static void PictureAsyncWork(uv_work_t* req);
             static void PictureAsyncAfter(uv_work_t* req);
 
-            static Handle<Value> Reset(const Arguments& args);
-            static void ResetAsyncWork(uv_work_t* req);
-            static void ResetAsyncAfter(uv_work_t* req);
-
             static Handle<Value> Motion(const Arguments& args);
+            static void MotionAsyncDurring(uv_async_t *handle, int status);
             static void MotionAsyncWork(uv_work_t* req);
-            static void MotionAsyncAfter(uv_work_t* req);
+            static void MotionAsyncAfter(uv_work_t *req, int status);
         };
 
 
@@ -496,7 +472,35 @@ namespace {
         VC0706* self = new VC0706();
         self->Wrap(args.This());
 
+        int i = 0;
+
         camera = new Camera();
+
+        char sensorRegValues[] = {
+        0x0C, 0x03, 0x0C, 0x03, 0x0C, 0x03, 0x0C, 0x03,
+        0x0C, 0x03, 0x0C, 0x03, 0x0C, 0x03, 0x0C, 0x03,
+        0x0C, 0x03, 0x0C, 0x03, 0x0C, 0x03, 0x0C, 0x03,
+        0x0C, 0x03, 0x0C, 0x03, 0x0C, 0x03, 0x0C, 0x03,
+        0x10, 0x04, 0x10, 0x04, 0x10, 0x04, 0x10, 0x04,
+        0x10, 0x04, 0x10, 0x04, 0x10, 0x04, 0x10, 0x04,
+        0x10, 0x04, 0x10, 0x04, 0x10, 0x04, 0x10, 0x04,
+        0x10, 0x04, 0x10, 0x04, 0x10, 0x04, 0x10, 0x04
+    };
+
+    for(i = 0; i < 64; i++) {
+        serialPutchar(camera->fd, (char)0x56);
+        serialPutchar(camera->fd, (char)0x00);
+        serialPutchar(camera->fd, (char)0x31);
+        serialPutchar(camera->fd, (char)0x08);
+        serialPutchar(camera->fd, (char)0x01);
+        serialPutchar(camera->fd, (char)0x04);
+        serialPutchar(camera->fd, (char)0x1a);
+        serialPutchar(camera->fd, (char)0x16);
+        serialPutchar(camera->fd, (char)sensorRegValues[i]);
+        serialPutchar(camera->fd, (char)0x00);
+        serialPutchar(camera->fd, (char)i);
+        serialPutchar(camera->fd, (char)0x01);
+    }
 
         return scope.Close(args.This());
     }
@@ -536,26 +540,19 @@ namespace {
         PictureBaton* pic_baton = static_cast<PictureBaton*>(req->data);
 
         if(camera->ready == 1){
-            camera->ready = 0;
-
-            // Force Stop motion detect
-                camera->setMotionDetect(0);
-
-                //Clear Buffer
-                camera->clearBuffer();
+            camera->ready = 0; // Camera is Busy
+            camera->motion = 0; //Don't allow motion
             
             //Take Picture
             pic_baton->pictureName = camera->takePicture();
 
-            //Clear Buffer
-            camera->clearBuffer();
-
             //Say camera is ready again
-            camera->ready = 1;
+            camera->ready = 1; // Camera is ready again
+            camera->motion = 0; //Motion Allowed again
         }
         else{
 
-            camera->stopMotion = 1;
+            camera->motion = 0; //Don't allow motion
 
             int t_count = 0;
             int timeout = 10 * TO_SCALE;
@@ -567,27 +564,19 @@ namespace {
             }
 
             if(camera->ready == 1){
-                camera->ready = 0;
+                camera->ready = 0; // Camera is Busy
+                camera->motion = 0; //Don't allow motion
 
-
-                // Force Stop motion detect
-                camera->setMotionDetect(0);
-
-                //Clear Buffer
-                camera->clearBuffer();
-                
                 //Take Picture
                 pic_baton->pictureName = camera->takePicture();
-
-                //Clear Buffer
-                camera->clearBuffer();
 
                 //Say camera is ready again
                 camera->ready = 1;
             }
-
-            // Reset stop motion detect
-            camera->stopMotion = 0;
+            else {
+                pic_baton->error = true;
+                pic_baton->error_message = "Camera couldn't take a picture";
+            }
             
         }
 
@@ -635,193 +624,77 @@ namespace {
     }
 
 
-
-    Handle<Value> VC0706::Reset(const Arguments& args) {
-        HandleScope scope;
-
-        if (args.Length() < 1) {
-            return ThrowException(
-                Exception::TypeError(String::New("Arguments: Callback Function"))
-                );
-        }
-
-        if (!args[0]->IsFunction()) {
-            return ThrowException(Exception::TypeError(
-                String::New("First argument must be a callback function")));
-        }
-
-        Local<Function> callback = Local<Function>::Cast(args[0]);
-
-        ResetBaton* reset_baton = new ResetBaton();
-        reset_baton->error = false;
-        reset_baton->callback = Persistent<Function>::New(callback);
-        reset_baton->emitter = Persistent<Object>::New(args.This());
-
-        uv_work_t *req = new uv_work_t();
-        req->data = reset_baton;
-
-        int status = uv_queue_work(uv_default_loop(), req, ResetAsyncWork, (uv_after_work_cb)ResetAsyncAfter);
-        assert(status == 0);
-
-        return Undefined();
-    }
-
-    void VC0706::ResetAsyncWork(uv_work_t* req) {
-        ResetBaton* reset_baton = static_cast<ResetBaton*>(req->data);
-
-        camera->reset();
-
-        reset_baton->versionNumber = camera->getVersion();
-
-    }
-
-    void VC0706::ResetAsyncAfter(uv_work_t* req) {
-        HandleScope scope;
-        ResetBaton* reset_baton = static_cast<ResetBaton*>(req->data);
-
-        if (reset_baton->error) {
-            Local<Value> err = Exception::Error(String::New(reset_baton->error_message.c_str()));
-
-            const unsigned argc = 1;
-            Local<Value> argv[argc] = { err };
-
-            TryCatch try_catch;
-            reset_baton->callback->Call(Context::GetCurrent()->Global(), argc, argv);
-
-            if (try_catch.HasCaught()) {
-                node::FatalException(try_catch);
-            }
-        } else {
-
-            Local<Value> event[2] = {
-            String::New("ResetComplete"), // event name
-            String::New("success")  // argument
-            };
-
-            MakeCallback(reset_baton->emitter, "emit", 2, event);
-
-
-            const unsigned argc = 2;
-            Local<Value> argv[argc] = {
-                Local<Value>::New(Null()),
-                Local<Value>::New(String::New(reset_baton->versionNumber.c_str()))
-            };
-
-            TryCatch try_catch;
-            reset_baton->callback->Call(Context::GetCurrent()->Global(), argc, argv);
-            if (try_catch.HasCaught()) {
-                node::FatalException(try_catch);
-            }
-        }
-
-        reset_baton->callback.Dispose();
-        reset_baton->emitter.Dispose();
-
-        free(reset_baton->display_message);
-
-        delete reset_baton;
-        delete req;
-    }
-
-
     Handle<Value> VC0706::Motion(const Arguments& args) {
         HandleScope scope;
 
 
         MotionBaton* motion_baton = new MotionBaton();
         motion_baton->error = false;
-        motion_baton->emitter = Persistent<Object>::New(args.This());
+        emitter = Persistent<Object>::New(args.This());
 
         uv_work_t *req = new uv_work_t();
-        req->data = motion_baton;
+        int size = 10240;
+        req->data = (void*) &size;
+        // req->data = motion_baton;
 
-        int status = uv_queue_work(uv_default_loop(), req, MotionAsyncWork, (uv_after_work_cb)MotionAsyncAfter);
-        assert(status == 0);
+
+        //TODO: Set up camera config for motion.
+
+
+        loop = uv_default_loop();
+
+        uv_async_init(loop, &async, MotionAsyncDurring);
+        uv_queue_work(loop, req, MotionAsyncWork, (uv_after_work_cb)MotionAsyncAfter);
+
 
         return Undefined();
     }
 
-    void VC0706::MotionAsyncWork(uv_work_t* req) {
-        MotionBaton* motion_baton = static_cast<MotionBaton*>(req->data);
+    void VC0706::MotionAsyncDurring(uv_async_t *handle, int status /*UNUSED*/) {
+        HandleScope scope;
 
-        if(camera->ready == 1) {
-            camera->ready = 0;
+        Local<Value> event[2] = {
+            String::New("motion") // event name
+        };
 
-            // Turn on motion detect
-            camera->setMotionDetect(1);
+        TryCatch tc;
+        MakeCallback(emitter, "emit", 1, event);
+        if (tc.HasCaught()) FatalException(tc);
 
-            //Clear Buffer
-            camera->clearBuffer();
 
-            // Wait for either motion or interupt
-            while (!camera->motionDetected() && camera->stopMotion == 0){
+    }
+
+    void VC0706::MotionAsyncWork(uv_work_t *req) {
+
+        // Trun on Motion Detecting
+        camera->setMotionDetect(1);
+
+        while (1) {
+            if(camera->motion){
+                // Logic for when its ok to check for motion
+
+                if(serialDataAvail(camera->fd)){
+                    
+                    if(camera->checkReply(COMM_MOTION_DETECTED, 5)) {
+                        // call event emitter on motion
+                        uv_async_send(&async);
+                    }
+                    else {
+                        printf("No Motion\n");
+                    }
+
+                }
+
             }
 
-            // If interupt
-            if(camera->stopMotion == 1) {
-                printf("Motion Was Internal - from printf\n");
-
-
-                // Stop event emitter
-                motion_baton->error = true;
-                motion_baton->error_message = "Motion Shutdown was internal";
-
-
-                // Force Stop motion detect
-                camera->setMotionDetect(0);
-
-                //Clear Buffer
-                camera->clearBuffer();
-
-                // Reset the stop motion
-                camera->stopMotion = 0;
-
-                // Say camera is ready
-                camera->ready = 1;
-            }
-            // If motion
-            else {
-
-                // Re-enable event emitter
-                motion_baton->error = false;
-
-                // Camera is "ready" at this instance
-                // (used for restarting after motion)
-                camera->ready = 1;
-            }
-
-
-        }
-        else {
-            motion_baton->error = true;
-            motion_baton->error_message = "Camera Busy";
         }
 
     }
 
-    void VC0706::MotionAsyncAfter(uv_work_t* req) {
-        HandleScope scope;
-        MotionBaton* motion_baton = static_cast<MotionBaton*>(req->data);
+    void VC0706::MotionAsyncAfter(uv_work_t *req, int status) {
 
-        if (motion_baton->error) {
-            
-        } else {
-
-            Local<Value> event[2] = {
-            String::New("MotionDetected"), // event name
-            String::New("Motion Detected")  // argument
-            };
-
-            MakeCallback(motion_baton->emitter, "emit", 2, event);
-
-        }
-
-        motion_baton->emitter.Dispose();
-
-        free(motion_baton->display_message);
-
-        delete motion_baton;
-        delete req;
+        fprintf(stderr, "Motion Loop Quit\n");
+        uv_close((uv_handle_t*) &async, NULL);
     }
 
 
@@ -835,7 +708,6 @@ void RegisterModule(Handle<Object> target) {
     t->InstanceTemplate()->SetInternalFieldCount(1);
     t->SetClassName(String::New("VC0706"));
     NODE_SET_PROTOTYPE_METHOD(t, "TakePicture", VC0706::TakePicture);
-    NODE_SET_PROTOTYPE_METHOD(t, "Reset", VC0706::Reset);
     NODE_SET_PROTOTYPE_METHOD(t, "MotionDetect", VC0706::Motion);
 
     target->Set(String::NewSymbol("VC0706"), t->GetFunction());
