@@ -666,7 +666,11 @@ namespace {
 
     void VC0706::MotionAsyncWork(uv_work_t *req) {
 
+        camera->clearBuffer();
+
         // Trun on Motion Detecting
+        camera->setMotionDetect(1);
+        camera->setMotionDetect(1);
         camera->setMotionDetect(1);
 
         while (1) {
